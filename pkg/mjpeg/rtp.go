@@ -5,9 +5,26 @@ import (
 	"encoding/binary"
 	"image"
 	"image/jpeg"
+	"sync"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/pion/rtp"
+)
+
+// Pool for reusing MJPEG RTP header buffers (h1/h2) to reduce per-packet allocations
+var (
+	mjpegH1Pool = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 8)
+			return &buf
+		},
+	}
+	mjpegH2Pool = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 4, 132)
+			return &buf
+		},
+	}
 )
 
 func RTPDepay(handlerFunc core.HandlerFunc) core.HandlerFunc {
@@ -101,18 +118,32 @@ func RTPPay(handlerFunc core.HandlerFunc) core.HandlerFunc {
 			return
 		}
 
-		h1 := make([]byte, 8)
+		// Get buffers from pool to reduce per-packet allocations
+		// Use two-value type assertion to avoid panic if Get() returns nil
+		h1Ptr, ok := mjpegH1Pool.Get().(*[]byte)
+		if !ok || h1Ptr == nil {
+			buf := make([]byte, 8)
+			h1Ptr = &buf
+		}
+		h1 := (*h1Ptr)[:8]
 		h1[4] = 1   // Type
 		h1[5] = 255 // Q
 
-		// MBZ=0, Precision=0, Length=128
-		h2 := make([]byte, 4, 132)
+		h2Ptr, ok := mjpegH2Pool.Get().(*[]byte)
+		if !ok || h2Ptr == nil {
+			buf := make([]byte, 4, 132)
+			h2Ptr = &buf
+		}
+		h2 := (*h2Ptr)[:4]
 		h2[3] = 128
 
 		var jpgData []byte
 		for jpgData == nil {
 			// 2 bytes h1
 			if p[0] != 0xFF {
+				// Return buffers to pool before returning
+				mjpegH1Pool.Put(h1Ptr)
+				mjpegH2Pool.Put(h2Ptr)
 				return
 			}
 
@@ -129,6 +160,9 @@ func RTPPay(handlerFunc core.HandlerFunc) core.HandlerFunc {
 				}
 			case 0xC0: // 2. Start Of Frame (size=15)
 				if p[4] != 8 {
+					// Return buffers to pool before returning
+					mjpegH1Pool.Put(h1Ptr)
+					mjpegH2Pool.Put(h2Ptr)
 					return
 				}
 				h := binary.BigEndian.Uint16(p[5:])
@@ -180,6 +214,10 @@ func RTPPay(handlerFunc core.HandlerFunc) core.HandlerFunc {
 			}
 			handlerFunc(&clone)
 		}
+
+		// Return buffers to pool after all packets are processed
+		mjpegH1Pool.Put(h1Ptr)
+		mjpegH2Pool.Put(h2Ptr)
 	}
 }
 

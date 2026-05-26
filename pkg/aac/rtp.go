@@ -2,10 +2,21 @@ package aac
 
 import (
 	"encoding/binary"
+	"sync"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/pion/rtp"
 )
+
+// Pool for reusing AAC RTP payload buffers to reduce per-frame memory allocations
+var aacPayloadPool = sync.Pool{
+	New: func() interface{} {
+		// Pre-allocate typical AAC payload buffer
+		// Header (4 bytes) + max AAC frame (~2048 bytes for high bitrate)
+		buf := make([]byte, 0, 4+2048)
+		return &buf
+	},
+}
 
 const RTPPacketVersionAAC = 0
 
@@ -75,8 +86,18 @@ func RTPPay(handler core.HandlerFunc) core.HandlerFunc {
 
 		// support ONLY one unit in payload
 		auSize := uint16(len(packet.Payload))
+
+		// Get buffer from pool to reduce per-frame allocations
+		// Use two-value type assertion to avoid panic if Get() returns nil
+		bufPtr, ok := aacPayloadPool.Get().(*[]byte)
+		if !ok || bufPtr == nil {
+			// Fallback: allocate new buffer if pool returns nil
+			buf := make([]byte, 0, 4+2048)
+			bufPtr = &buf
+		}
+		payload := (*bufPtr)[:2+2+auSize]
+
 		// 2 bytes header size + 2 bytes first payload size
-		payload := make([]byte, 2+2+auSize)
 		payload[1] = 16 // header size in bits
 		binary.BigEndian.PutUint16(payload[2:], auSize<<3)
 		copy(payload[4:], packet.Payload)
@@ -91,6 +112,9 @@ func RTPPay(handler core.HandlerFunc) core.HandlerFunc {
 			Payload: payload,
 		}
 		handler(&clone)
+
+		// Return buffer to pool after handler processes it
+		aacPayloadPool.Put(bufPtr)
 
 		seq++
 		ts += AUTime
